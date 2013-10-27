@@ -204,7 +204,7 @@ module RailsWrappers
 
     included do
       class_attribute :_wrappers, :_wrappers_conditions, :instance_accessor => false
-      self._wrappers = nil
+      self._wrappers = []
       self._wrappers_conditions = {}
       _write_wrapper_methods
     end
@@ -228,10 +228,10 @@ module RailsWrappers
         #
         # ==== Returns
         # * <tt> Boolean</tt> - True if the action has a wrappers definition, false otherwise.
-        def _conditional_wrappers?
+        def _conditional_wrappers? wrapper
           return unless super
 
-          conditions = _wrappers_conditions
+          conditions = _wrappers_conditions[wrapper]
 
           if only = conditions[:only]
             only.include?(action_name)
@@ -258,13 +258,15 @@ module RailsWrappers
       # ==== Options (conditions)
       # * :only - A list of actions to apply this wrappers to.
       # * :except - Apply this wrappers to all actions but this one.
-      def wrappers(wrappers, conditions = {})
+      def wrappers(*wrappers, conditions = {})
         include WrappersConditions unless conditions.empty?
 
         conditions.each {|k, v| conditions[k] = Array(v).map {|a| a.to_s} }
-        self._wrappers_conditions = conditions
+        wrappers.each do |wrapper|
+          self._wrappers_conditions[wrapper] = conditions
+        end
 
-        self._wrappers = wrappers
+        self._wrappers += wrappers
         _write_wrapper_methods
       end
 
@@ -273,10 +275,10 @@ module RailsWrappers
       # If a wrappers is not explicitly mentioned then look for a wrappers with the controller's name.
       # if nothing is found then try same procedure to find super class's wrappers.
       def _write_wrapper_methods # :nodoc:
-        self_wrappers.each do |wrappper|
-            remove_possible_method(wrapper)
+        self._wrappers.each_with_index do |wrapper, i|
+            remove_possible_method("_wrapper_#{i}")
 
-          prefixes = _implied_wrappers_name =~ /\bwrapperss/ ? [] : ["wrapperss"]
+          prefixes = _implied_wrappers_name =~ /\blayouts/ ? [] : ["layouts"]
           default_behavior = "lookup_context.find_all('#{_implied_wrappers_name}', #{prefixes.inspect}).first || super"
           name_clause = if name
             default_behavior
@@ -286,44 +288,44 @@ module RailsWrappers
             RUBY
           end
 
-          wrappers_definition = case _wrappers
+          wrapper_definition = case wrapper
             when String
               _wrappers.inspect
             when Symbol
               <<-RUBY
-                #{_wrappers}.tap do |wrappers|
-                  return #{default_behavior} if wrappers.nil?
-                    unless wrappers.is_a?(String) || !wrappers
-                    raise ArgumentError, "Your wrappers method :#{_wrappers} returned \#{wrappers}. It " \
-                      "should have returned a String, false, or nil"
+                #{wrapper}.tap do |_wrapper|
+                  return #{default_behavior} if _wrapper.nil?
+                    unless _wrapper.is_a?(String) || _wrapper
+                      raise ArgumentError, "Your wrapper method :#{wrapper} returned \#{_wrapper}. It " \
+                        "should have returned a String, false, or nil"
                   end
                 end
               RUBY
             when Proc
-              define_method :_wrappers_from_proc, &_wrappers
-              protected :_wrappers_from_proc
+              define_method :"_wrapper_from_proc_#{i}", &wrapper
+              protected :"_wrapper_from_proc_#{i}"
               <<-RUBY
-                result = _wrappers_from_proc(#{_wrappers.arity == 0 ? '' : 'self'})
+                result = _wrapper_from_proc_#{i}(#{_wrappers.arity == 0 ? '' : 'self'})
                 return #{default_behavior} if result.nil?
                 result
               RUBY
             when false
               nil
             when true
-              raise ArgumentError, "Wrappers must be specified as a String, Symbol, Proc, false, or nil"
+              raise ArgumentError, "Wrappers must be specified as Strings, Symbols, Procs, false, or nil"
             when nil
               name_clause
           end
 
           self.class_eval <<-RUBY, __FILE__, __LINE__ + 1
-            def _wrappers
+            def _wrapper_#{i}
               if _conditional_wrappers?
-              #{wrappers_definition}
+                #{wrapper_definition}
               else
-              #{name_clause}
+                #{name_clause}
               end
             end
-            private :_wrappers
+            private :_wrapper_#{i}
           RUBY
         end
       end
@@ -333,8 +335,8 @@ module RailsWrappers
       super
 
       if _include_wrappers?(options)
-        wrappers = options.delete(:wrappers) { :default }
-        options[:wrappers] = _wrappers_for_option(wrappers)
+        wrappers = options.delete(:wrappers) { self.class._wrappers }
+        options[:wrappers] = _wrappers_for_option(*wrappers)
       end
     end
 
@@ -361,52 +363,32 @@ module RailsWrappers
       true
     end
 
-    # This will be overwritten by _write_wrappers_method
-    def _wrappers; end
+    # These will be overwritten by _write_wrapper_methods
+    self._wrappers.each_with_index do |wrapper, i|
+      self.class_eval <<-RUBY, __FILE__, __LINE__ + 1
+        def _wrapper_#{i}; end
+      RUBY
+    end
 
-    # Determine the wrappers for a given name, taking into account the name type.
+
+    # Determine the wrappers for the given names, taking into account the name type.
     #
     # ==== Parameters
-    # * <tt>name</tt> - The name of the template
-    def _wrappers_for_option(name)
-      case name
-      when String then _normalize_wrappers(name)
-      when Proc then name
-      when true then Proc.new { _default_wrappers(true) }
-      when :default then Proc.new { _default_wrappers(false) }
-      when false, nil then nil
-      else
-        raise ArgumentError,
-          "String, Proc, :default, true, or false, expected for `wrappers'; you passed #{name.inspect}"
+    # * <tt>names</tt> - The names of the templates
+    def _wrappers_for_option(*names)
+      names.map do |name|
+        case name
+        when String then _normalize_wrapper(name)
+        when Proc then name
+        else
+          raise ArgumentError,
+            "String, Proc expected for `wrappers'; you passed #{name.inspect}"
+        end
       end
     end
 
-    def _normalize_wrappers(value)
-      value.is_a?(String) && value !~ /\bwrapperss/ ? "wrapperss/#{value}" : value
-    end
-
-    # Returns the default wrappers for this controller.
-    # Optionally raises an exception if the wrappers could not be found.
-    #
-    # ==== Parameters
-    # * <tt>require_wrappers</tt> - If set to true and wrappers is not found,
-    # an ArgumentError exception is raised (defaults to false)
-    #
-    # ==== Returns
-    # * <tt>template</tt> - The template object for the default wrappers (or nil)
-    def _default_wrappers(require_wrappers = false)
-      begin
-        value = _wrappers if action_has_wrappers?
-      rescue NameError => e
-        raise e, "Could not render wrappers: #{e.message}"
-      end
-
-      if require_wrappers && action_has_wrappers? && !value
-        raise ArgumentError,
-          "There was no default wrappers for #{self.class} in #{view_paths.inspect}"
-      end
-
-      _normalize_wrappers(value)
+    def _normalize_wrapper(value)
+      value.is_a?(String) && value !~ /\blayouts/ ? "layouts/#{value}" : value
     end
 
     def _include_wrappers?(options)
